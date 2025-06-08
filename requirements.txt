@@ -1,0 +1,8 @@
+transformers
+torch
+tensorflow
+tokenizers
+scikit-learn
+pandas
+matplotlib
+seaborn
