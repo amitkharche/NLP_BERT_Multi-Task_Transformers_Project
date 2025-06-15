@@ -1,73 +1,83 @@
-from transformers import (TFBertForSequenceClassification, TFBertForTokenClassification,
-                          BertTokenizerFast, create_optimizer)
+from transformers import TFBertForSequenceClassification, BertTokenizerFast, create_optimizer
 from datasets import load_dataset
 import tensorflow as tf
-import argparse
 
-def train_sentiment(model_name='bert-base-uncased', epochs=2, batch_size=8):
+# ✅ Helper function to manually unpack a batch
+def unpack_batch(batch):
+    if isinstance(batch, (list, tuple)):
+        if len(batch) == 3:
+            x, y, sample_weight = batch
+        elif len(batch) == 2:
+            x, y = batch
+            sample_weight = None
+        else:
+            raise ValueError(f"Unexpected batch length: {len(batch)}")
+    else:
+        raise TypeError("Batch is not a tuple/list.")
+    return x, y, sample_weight
+
+# ✅ Load and preprocess dataset
+def load_imdb_dataset(model_name='bert-base-uncased'):
     tokenizer = BertTokenizerFast.from_pretrained(model_name)
     dataset = load_dataset("imdb")
-    dataset = dataset.map(lambda e: tokenizer(e['text'], truncation=True, padding='max_length', max_length=512),
-                          batched=True)
+
+    def tokenize(example):
+        return tokenizer(example['text'], truncation=True, padding='max_length', max_length=512)
+
+    dataset = dataset.map(tokenize, batched=True)
     dataset.set_format(type='tensorflow', columns=['input_ids', 'attention_mask', 'label'])
 
-    train = dataset['train'].to_tf_dataset(
+    train_dataset = dataset['train'].to_tf_dataset(
         columns=['input_ids', 'attention_mask'],
         label_cols='label',
         shuffle=True,
-        batch_size=batch_size)
+        batch_size=8
+    )
+
+    test_dataset = dataset['test'].to_tf_dataset(
+        columns=['input_ids', 'attention_mask'],
+        label_cols='label',
+        shuffle=False,
+        batch_size=8
+    )
+
+    return train_dataset, test_dataset
+
+# ✅ Train function using manual batch unpacking
+def train_model():
+    model_name = 'bert-base-uncased'
+    train_dataset, test_dataset = load_imdb_dataset(model_name)
 
     model = TFBertForSequenceClassification.from_pretrained(model_name, num_labels=2)
-    optimizer, _ = create_optimizer(init_lr=2e-5, num_train_steps=len(train)*epochs, num_warmup_steps=0)
-    model.compile(optimizer=optimizer, loss=model.compute_loss, metrics=['accuracy'])
-    model.fit(train, epochs=epochs)
-    model.save_pretrained('output/bert_sentiment')
 
-def train_ner(model_name='bert-base-cased', epochs=3, batch_size=8):
-    tokenizer = BertTokenizerFast.from_pretrained(model_name)
-    dataset = load_dataset("conll2003")
-    label_list = dataset['train'].features['ner_tags'].feature.names
+    optimizer, _ = create_optimizer(
+        init_lr=2e-5,
+        num_train_steps=len(train_dataset) * 2,
+        num_warmup_steps=0
+    )
 
-    def tokenize_and_align_labels(examples):
-        tokenized_inputs = tokenizer(examples['tokens'], truncation=True, is_split_into_words=True, padding='max_length', max_length=128)
-        labels = []
-        for i, label in enumerate(examples['ner_tags']):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)
-            label_ids = []
-            previous_word_idx = None
-            for word_idx in word_ids:
-                if word_idx is None:
-                    label_ids.append(-100)
-                elif word_idx != previous_word_idx:
-                    label_ids.append(label[word_idx])
-                else:
-                    label_ids.append(label[word_idx] if True else -100)
-                previous_word_idx = word_idx
-            labels.append(label_ids)
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    metric = tf.keras.metrics.SparseCategoricalAccuracy()
 
-    dataset = dataset.map(tokenize_and_align_labels, batched=True)
-    dataset.set_format(type='tensorflow', columns=['input_ids', 'attention_mask', 'labels'])
+    for epoch in range(2):
+        print(f"\nEpoch {epoch + 1}")
+        metric.reset_states()
 
-    train = dataset['train'].to_tf_dataset(
-        columns=['input_ids', 'attention_mask'],
-        label_cols='labels',
-        shuffle=True,
-        batch_size=batch_size)
+        for step, batch in enumerate(train_dataset):
+            x, y, sample_weight = unpack_batch(batch)
 
-    model = TFBertForTokenClassification.from_pretrained(model_name, num_labels=len(label_list))
-    optimizer, _ = create_optimizer(init_lr=3e-5, num_train_steps=len(train)*epochs, num_warmup_steps=0)
-    model.compile(optimizer=optimizer, loss=model.compute_loss)
-    model.fit(train, epochs=epochs)
-    model.save_pretrained('output/bert_ner')
+            with tf.GradientTape() as tape:
+                logits = model(x, training=True).logits
+                loss = loss_fn(y, logits, sample_weight=sample_weight)
+
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            metric.update_state(y, logits)
+
+            if step % 100 == 0:
+                print(f"Step {step}: Loss = {loss.numpy():.4f}, Accuracy = {metric.result().numpy():.4f}")
+
+    model.save_pretrained("output/bert_sentiment_custom")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=["sentiment", "ner"], required=True)
-    args = parser.parse_args()
-
-    if args.task == "sentiment":
-        train_sentiment()
-    elif args.task == "ner":
-        train_ner()
+    train_model()
